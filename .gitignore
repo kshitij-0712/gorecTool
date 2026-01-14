@@ -1,0 +1,4 @@
+testModules/
+*.sum
+*.mod
+*.exe
