@@ -41,33 +41,64 @@ func (s *SubdomainModule) Run(rootDomain string) []string {
 }
 
 func (s *SubdomainModule) fetchFromCrtSh(domain string) []string {
-	// We use the % wildcard to find subdomains
+	// 1. Define the URL
 	url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		fmt.Println(err)
-		return []string{}
-	}
-
-	// req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
-
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("[Error] Failed to connect to CRT.sh: %v\n", err)
-		return []string{}
-	}
-	defer resp.Body.Close()
 
 	var results []CrtShResult
-	fmt.Printf("%v %T", resp, resp)
-	// Decode JSON response
-	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-		// Sometimes crt.sh returns 502 or HTML on overload
-		fmt.Printf("[Error] Failed to parse CRT.sh response: %v\n", err)
-		return []string{}
+
+	// 2. Retry Logic (Try 3 times)
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+
+		client := &http.Client{Timeout: 20 * time.Second}
+		req, _ := http.NewRequest("GET", url, nil)
+
+		// Add a User-Agent (Sometimes helps avoid blocks)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+		resp, err := client.Do(req)
+
+		// Network error? Wait and retry.
+		if err != nil {
+			fmt.Printf("[Error] Network failure: %v. Retrying (%d/%d)...\n", err, i+1, maxRetries)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// 3. Handle Status Codes
+		if resp.StatusCode == 429 || resp.StatusCode == 502 || resp.StatusCode == 503 {
+			// Rate limited or Server overload
+			resp.Body.Close() // Close before sleeping
+			fmt.Printf("[!] CRT.sh is overloaded (Status %d). Sleeping 5s before retry (%d/%d)...\n", resp.StatusCode, i+1, maxRetries)
+			time.Sleep(5 * time.Second) // Wait longer for 429s
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			// Some other permanent error (404, 403)
+			fmt.Printf("[Error] CRT.sh returned unexpected status: %d\n", resp.StatusCode)
+			resp.Body.Close()
+			break
+		}
+
+		// 4. Decode JSON (Only if 200 OK)
+		if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+			// Sometimes they send 200 OK but with broken HTML/JSON
+			resp.Body.Close()
+			// Only retry if it looks like a temporary glitch
+			if i < maxRetries-1 {
+				fmt.Println("[!] Failed to decode JSON. Retrying...")
+				time.Sleep(2 * time.Second)
+				continue
+			}
+		} else {
+			// Success!
+			resp.Body.Close()
+			break
+		}
 	}
 
+	// 5. Convert results to string slice
 	var output []string
 	for _, r := range results {
 		output = append(output, r.NameValue)
@@ -78,7 +109,7 @@ func (s *SubdomainModule) fetchFromCrtSh(domain string) []string {
 func (s *SubdomainModule) cleanDomains(raw []string, rootDomain string) []string {
 	uniqueMap := make(map[string]bool)
 	var clean []string
-	fmt.Println(raw, rootDomain)
+	// fmt.Println(raw, rootDomain)
 	for _, domain := range raw {
 		// Convert to lowercase
 		d := strings.ToLower(domain)

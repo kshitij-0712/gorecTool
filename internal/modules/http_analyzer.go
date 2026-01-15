@@ -42,7 +42,7 @@ func (h *HttpAnalyzer) Analyze(target string, port int) {
 
 	// 2. Fetch the Page
 	resp, err := client.Get(url)
-	fmt.Printf("here%v %v", resp, err)
+	// fmt.Printf("here%v %v", resp, err)
 	if err != nil {
 		// If HTTP fails on port 80, maybe it redirects to HTTPS?
 		// For now, we just log the error.
@@ -54,7 +54,7 @@ func (h *HttpAnalyzer) Analyze(target string, port int) {
 
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	bodyStr := string(bodyBytes)
-	fmt.Println(bodyBytes, bodyStr)
+	// fmt.Println(bodyBytes, bodyStr)
 	// 4. Extract Data
 	title := extractTitle(bodyStr)
 	server := resp.Header.Get("Server")
@@ -68,7 +68,7 @@ func (h *HttpAnalyzer) Analyze(target string, port int) {
 	h.Brain.Publish(engine.Event{
 		Type:    engine.EventHttpService,
 		Target:  target,
-		Payload: fmt.Sprintf("%s|%s", server, tech),
+		Payload: fmt.Sprintf("%s|%s|%d", server, tech, port),
 	})
 }
 

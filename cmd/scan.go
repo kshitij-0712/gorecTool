@@ -42,13 +42,12 @@ var scanCmd = &cobra.Command{
 
 		brain := engine.NewEngine(&engineWg)
 
-		engineWg.Add(1)
-		go brain.Start()
 		var analysisWg sync.WaitGroup
 		// 2. Setup Modules
 		subEnum := modules.NewSubdomainModule(brain)
 		portScanner := modules.NewPortScanner(brain)
 		httpAnalyzer := modules.NewHttpAnalyzer(brain)
+		fileHunter := modules.NewFileHunter(brain)
 		portScanner.ScanTarget(targetDomain, isDeepScan)
 		var scanWg sync.WaitGroup
 		// 3. Add Rules (Ideally, move these to a separate 'rules' package later)
@@ -63,7 +62,44 @@ var scanCmd = &cobra.Command{
 		// 		}()
 		// 	},
 		// })
+		brain.AddRule(engine.Rule{
+			Name: "Context-Fuzzer",
+			Condition: func(e engine.Event) bool {
+				// Only trigger if we successfully analyzed the HTTP service
+				return e.Type == engine.EventHttpService
+			},
+			Action: func(e engine.Event) {
+				// The payload format from HttpAnalyzer is: "ServerHeader|TechStack"
+				parts := strings.Split(e.Payload, "|")
+				if len(parts) < 3 {
+					return
+				} // Safety check
 
+				techStack := parts[1]
+
+				port, _ := strconv.Atoi(parts[2]) // Extract the port we just added
+
+				analysisWg.Add(1)
+				go func() {
+					defer analysisWg.Done()
+					fileHunter.Hunt(e.Target, port, techStack)
+				}()
+				// We need the port. Since the 'Target' in HttpService event is usually just the domain/IP,
+				// we might need to assume the port or include it in the event.
+				// Ideally, update HttpAnalyzer to include port in Target string (e.g., "example.com:80")
+				// For now, let's assume port 80 if not specified, or extract from target if present.
+
+				// Simpler Hack: Let's assume standard ports for this demo rule,
+				// or pass the port in the Payload like "Server|Tech|Port"
+
+				// Let's stick to the current architecture:
+				// The 'Target' for HttpService event *should* match the input target.
+				// But we need the port. Let's fix this in Step 3 below.
+
+				// Assuming we fixed the data flow:
+
+			},
+		})
 		brain.AddRule(engine.Rule{
 			Name: "Web-Discovery",
 			Condition: func(e engine.Event) bool {
@@ -87,6 +123,8 @@ var scanCmd = &cobra.Command{
 			},
 		})
 
+		engineWg.Add(1)
+		go brain.Start()
 		// 3. PHASE 1: Subdomain Enumeration
 		fmt.Println("\n=== PHASE 1: Enumerating Subdomains ===")
 		aliveSubdomains := subEnum.Run(targetDomain)
@@ -113,9 +151,10 @@ var scanCmd = &cobra.Command{
 			reader := bufio.NewReader(os.Stdin)
 			choice, _ = reader.ReadString('\n')
 			choice = strings.TrimSpace(choice)
+		} else {
+			choice = ""
 		}
 
-		choice = ""
 		// 5. PHASE 3: Execution
 		var targetsToDeepScan []string
 		var targetsToQuickScan []string
