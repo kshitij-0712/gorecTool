@@ -6,8 +6,8 @@ import (
 	"os"
 
 	// Import your internal packages
-	"gorecon/internal/engine"
-	"gorecon/internal/modules"
+	"gorecTool/internal/engine"
+	"gorecTool/internal/modules"
 	"strconv"
 	"strings"
 	"sync"

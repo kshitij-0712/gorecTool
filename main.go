@@ -1,7 +1,7 @@
 package main
 
 import (
-	"gorecon/cmd"
+	"gorecTool/cmd"
 )
 
 func main() {
