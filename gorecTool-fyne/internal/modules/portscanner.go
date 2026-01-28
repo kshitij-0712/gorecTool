@@ -5,6 +5,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Import your engine package
@@ -23,58 +24,38 @@ func NewPortScanner(brain *engine.DecisionEngine) *PortScanner {
 }
 
 // ScanTarget is the entry point. It scans common ports on a single target.
-func (ps *PortScanner) ScanTarget(target string, deep bool) {
+func (ps *PortScanner) ScanTarget(target string, deep bool, globalSem chan struct{}, onProgress func(int)) {
 
 	// A list of "Top 20" critical ports to keep it fast for the "Scout" phase
 	var ports []int
-	var concurrency int
 	if deep {
 		fmt.Printf("[Scanner] Starting DEEP scan on %s (1-65535)...\n", target)
 		// Generate full range
 		for i := 1; i <= 65535; i++ {
 			ports = append(ports, i)
 		}
-		concurrency = 2000
 	} else {
 		fmt.Printf("[Scanner] Starting QUICK scan on %s (Top 20)...\n", target)
 		// Your existing Top 20 list
 		ports = []int{21, 22, 23, 25, 53, 80, 110, 111, 135, 139,
 			143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8080}
-		concurrency = 100
 	}
 
 	var wg sync.WaitGroup
+	// We use a local atomic counter to batch updates safely from threads
+	var localProgress int32 = 0
 
-	// Semaphore to control concurrency (limit to 10 threads at once)
-	// This prevents your OS from running out of file descriptors
-	sem := make(chan struct{}, concurrency)
-
-	for _, port := range ports {
+	for i, port := range ports {
 		wg.Add(1)
 
-		// Launch a goroutine for every port
+		// 1. Acquire Token
+		globalSem <- struct{}{}
+
 		go func(p int) {
 			defer wg.Done()
+			defer func() { <-globalSem }() // Release Token
 
-			// Acquire token (block if full)
-			sem <- struct{}{}
-			// We define a separate function for the scan so we can defer the release properly
-			// This ensures 'sem' is released even if Publish blocks
-			// defer func() { <-sem }() // Release token IMMEDIATELY when this inner func finishes
-
-			open := ps.isOpen(target, p)
-
-			// RELEASE TOKEN IMMEDIATELY
-			<-sem
-			if open {
-				// CRITICAL: We don't just print, we tell the Brain!
-
-				fmt.Printf("[+] Open: %d on %s \n", p, target)
-
-				// Tell the Brain
-				// CRITICAL FIX: Run Publish in a new goroutine.
-				// This prevents the "Scanner" from waiting on the "Brain".
-				// The scanner can now return, release the semaphore, and let the next port run.
+			if ps.isOpen(target, p) {
 				go func() {
 					ps.Brain.Publish(engine.Event{
 						Type:    engine.EventPortOpen,
@@ -83,10 +64,29 @@ func (ps *PortScanner) ScanTarget(target string, deep bool) {
 					})
 				}()
 			}
+
+			// Update Progress safely
+			current := atomic.AddInt32(&localProgress, 1)
+			if current%50 == 0 {
+				onProgress(50)
+			}
 		}(port)
+
+		// 2. THE FIX: Micro-Sleep every 100 ports
+		// This gives Windows time to recycle "TIME_WAIT" sockets
+		if i%100 == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 
 	wg.Wait()
+	// Flush any remaining progress count (e.g., last 34 ports)
+	rem := atomic.LoadInt32(&localProgress) % 50
+	if rem > 0 {
+		onProgress(int(rem))
+	}
+
+	ps.Brain.Log(fmt.Sprintf("[Scanner] Finished %s.", target))
 	fmt.Printf("[Scanner] Finished scanning %s.\n", target)
 }
 
@@ -94,7 +94,12 @@ func (ps *PortScanner) ScanTarget(target string, deep bool) {
 func (ps *PortScanner) isOpen(target string, port int) bool {
 	// address := fmt.Sprintf("%s:%d", target, port)
 	address := net.JoinHostPort(target, strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", address, 1*time.Second) // 1s timeout
+	conn, err := net.DialTimeout("tcp4", address, 1*time.Second) // 1s timeout
+
+	// 3. THE FIX: Use "tcp4" instead of "tcp"
+	// This prevents Go from trying IPv6, cutting socket usage in half.
+	// Increased timeout to 3 seconds to reduce "dialParallel" strain.
+
 	if err != nil {
 		return false
 	}

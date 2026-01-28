@@ -38,14 +38,16 @@ type DecisionEngine struct {
 	Bus      chan Event
 	wg       *sync.WaitGroup
 	Callback UIUpdateFunc
+	BusyWg   *sync.WaitGroup // <--- NEW: Tracks buffered events
 }
 
-func NewEngine(wg *sync.WaitGroup, cb UIUpdateFunc) *DecisionEngine {
+func NewEngine(wg *sync.WaitGroup, busyWg *sync.WaitGroup, cb UIUpdateFunc) *DecisionEngine {
 	return &DecisionEngine{
 		Rules:    []Rule{},
 		Bus:      make(chan Event, 1000), // Buffered channel
 		wg:       wg,
 		Callback: cb,
+		BusyWg:   busyWg,
 	}
 }
 
@@ -75,6 +77,11 @@ func (de *DecisionEngine) Start() {
 				// Run the action (usually distinct from the engine in real code)
 				go rule.Action(event)
 			}
+
+		}
+		// EVENT PROCESSED: Mark as done
+		if de.BusyWg != nil {
+			de.BusyWg.Done() // <--- Signal that we finished one item
 		}
 	}
 }
@@ -88,5 +95,9 @@ func (de *DecisionEngine) Log(message string) {
 
 // Publish is used by modules to send data to the brain
 func (de *DecisionEngine) Publish(e Event) {
+	// EVENT ADDED: Mark as busy
+	if de.BusyWg != nil {
+		de.BusyWg.Add(1) // <--- Signal that work entered the pipe
+	}
 	de.Bus <- e
 }

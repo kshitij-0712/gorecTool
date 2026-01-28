@@ -1,7 +1,7 @@
 package modules
 
 import (
-	"encoding/json"
+	"bufio"
 	"fmt"
 	"gorecTool/internal/engine"
 	"net"
@@ -19,152 +19,144 @@ func NewSubdomainModule(brain *engine.DecisionEngine) *SubdomainModule {
 	return &SubdomainModule{Brain: brain}
 }
 
-// CrtShResult represents the JSON structure returned by crt.sh
-type CrtShResult struct {
-	NameValue string `json:"name_value"`
-}
-
-// Run is the main entry point for this module
 func (s *SubdomainModule) Run(rootDomain string) []string {
-	fmt.Printf("[Subdomain] 🔍 querying CRT.sh for %s (Passive)... \n", rootDomain)
+	s.Brain.Log(fmt.Sprintf("Phase 1: Starting Passive Recon on %s...", rootDomain))
 
-	// 1. Fetch raw domains from API
-	rawDomains := s.fetchFromCrtSh(rootDomain)
-	fmt.Printf("[Subdomain] Found %d raw entries. Cleaning...\n", len(rawDomains))
+	// 1. Try Reliable Passive Source (HackerTarget)
+	domains := s.fetchFromHackerTarget(rootDomain)
 
-	// 2. Clean and Deduplicate
-	cleanDomains := s.cleanDomains(rawDomains, rootDomain)
-	fmt.Printf("[Subdomain] %d unique subdomains found. Validating DNS...\n", len(cleanDomains))
+	// 2. If Passive failed or found nothing, switch to Active Brute Force
+	if len(domains) == 0 {
+		s.Brain.Log("Passive sources failed or found nothing. Switching to ACTIVE Brute Force...")
+		domains = s.bruteForceSubdomains(rootDomain)
+	} else {
+		s.Brain.Log(fmt.Sprintf("Passive Recon success. Found %d candidates.", len(domains)))
+	}
 
-	// 3. Validate (DNS Resolution) and Publish
-	return s.validateAndPublish(cleanDomains)
+	// 3. Validation (DNS Check)
+	// Even if we brute forced them, we double check they are actually alive
+	return s.validateAndVerify(domains)
 }
 
-func (s *SubdomainModule) fetchFromCrtSh(domain string) []string {
-	// 1. Define the URL
-	url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
+// SOURCE 1: HackerTarget (More reliable than CRT.sh)
+func (s *SubdomainModule) fetchFromHackerTarget(domain string) []string {
+	url := fmt.Sprintf("https://api.hackertarget.com/hostsearch/?q=%s", domain)
 
-	var results []CrtShResult
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		s.Brain.Log(fmt.Sprintf("[!] Passive API Error: %v", err))
+		return []string{}
+	}
+	defer resp.Body.Close()
 
-	// 2. Retry Logic (Try 3 times)
-	maxRetries := 3
-	for i := 0; i < maxRetries; i++ {
+	// HackerTarget returns CSV lines: "hostname,ip"
+	// Example:
+	// www.google.com,142.250.1.1
+	// mail.google.com,142.250.1.2
 
-		client := &http.Client{Timeout: 20 * time.Second}
-		req, _ := http.NewRequest("GET", url, nil)
-
-		// Add a User-Agent (Sometimes helps avoid blocks)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-
-		resp, err := client.Do(req)
-
-		// Network error? Wait and retry.
-		if err != nil {
-			fmt.Printf("[Error] Network failure: %v. Retrying (%d/%d)...\n", err, i+1, maxRetries)
-			time.Sleep(3 * time.Second)
-			continue
-		}
-
-		// 3. Handle Status Codes
-		if resp.StatusCode == 429 || resp.StatusCode == 502 || resp.StatusCode == 503 {
-			// Rate limited or Server overload
-			resp.Body.Close() // Close before sleeping
-			fmt.Printf("[!] CRT.sh is overloaded (Status %d). Sleeping 5s before retry (%d/%d)...\n", resp.StatusCode, i+1, maxRetries)
-			time.Sleep(5 * time.Second) // Wait longer for 429s
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			// Some other permanent error (404, 403)
-			fmt.Printf("[Error] CRT.sh returned unexpected status: %d\n", resp.StatusCode)
-			resp.Body.Close()
-			break
-		}
-
-		// 4. Decode JSON (Only if 200 OK)
-		if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-			// Sometimes they send 200 OK but with broken HTML/JSON
-			resp.Body.Close()
-			// Only retry if it looks like a temporary glitch
-			if i < maxRetries-1 {
-				fmt.Println("[!] Failed to decode JSON. Retrying...")
-				time.Sleep(2 * time.Second)
-				continue
+	var results []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ",")
+		if len(parts) >= 1 {
+			// Clean up the domain part
+			d := strings.TrimSpace(parts[0])
+			if d != "" && strings.Contains(d, domain) {
+				results = append(results, d)
 			}
-		} else {
-			// Success!
-			resp.Body.Close()
-			break
 		}
 	}
 
-	// 5. Convert results to string slice
-	var output []string
-	for _, r := range results {
-		output = append(output, r.NameValue)
+	if len(results) == 0 {
+		s.Brain.Log("[!] HackerTarget returned empty list.")
 	}
-	return output
+	return results
 }
 
-func (s *SubdomainModule) cleanDomains(raw []string, rootDomain string) []string {
+// SOURCE 2: Active Brute Force (The "Manual" Way)
+func (s *SubdomainModule) bruteForceSubdomains(rootDomain string) []string {
+	// A small, high-value wordlist for fallback
+	// In a real tool, you might load this from a file
+	commonSubs := []string{
+		"www", "mail", "remote", "blog", "webmail", "server",
+		"ns1", "ns2", "smtp", "secure", "vpn", "m", "shop",
+		"ftp", "mail2", "test", "portal", "ns", "ww1", "host",
+		"support", "dev", "web", "bbs", "ww42", "mx", "email",
+		"cloud", "1", "mail1", "2", "forum", "owa", "www2",
+		"gw", "admin", "store", "mx1", "cdn", "api", "exchange",
+		"app", "gov", "2020", "gov", "news",
+	}
+
+	var found []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Limit concurrency to avoid getting banned by ISP DNS
+	sem := make(chan struct{}, 20)
+
+	for _, sub := range commonSubs {
+		target := fmt.Sprintf("%s.%s", sub, rootDomain)
+
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Attempt to resolve
+			_, err := net.LookupHost(t)
+			if err == nil {
+				// It exists!
+				mu.Lock()
+				found = append(found, t)
+				mu.Unlock()
+				s.Brain.Log(fmt.Sprintf("[Active] Discovered: %s", t))
+			}
+		}(target)
+	}
+	wg.Wait()
+	return found
+}
+
+func (s *SubdomainModule) validateAndVerify(domains []string) []string {
+	// Deduplicate first
 	uniqueMap := make(map[string]bool)
 	var clean []string
-	// fmt.Println(raw, rootDomain)
-	for _, domain := range raw {
-		// Convert to lowercase
-		d := strings.ToLower(domain)
-
-		// Remove wildcards like "*.example.com"
-		if strings.Contains(d, "*") {
-			continue
-		}
-
-		// Ensure it actually belongs to our target (cleanup garbage data)
-		if !strings.HasSuffix(d, rootDomain) {
-			continue
-		}
-
-		// Deduplicate: If we haven't seen it yet, add it
+	for _, d := range domains {
 		if _, exists := uniqueMap[d]; !exists {
 			uniqueMap[d] = true
 			clean = append(clean, d)
 		}
 	}
-	return clean
-}
 
-func (s *SubdomainModule) validateAndPublish(domains []string) []string {
-	fmt.Println(domains)
+	s.Brain.Log(fmt.Sprintf("Validating %d unique subdomains...", len(clean)))
+
+	// Validate (DNS Resolution)
 	var alive []string
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	sem := make(chan struct{}, 50)
 
-	for _, d := range domains {
+	for _, d := range clean {
 		wg.Add(1)
 		go func(subdomain string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			if ip, err := net.LookupHost(subdomain); err == nil {
-
+			if _, err := net.LookupHost(subdomain); err == nil {
 				mu.Lock()
-				alive = append(alive, subdomain) // Add to list
+				alive = append(alive, subdomain)
 				mu.Unlock()
 
-				fmt.Printf("   [+] Alive: %s at ip : %s\n", subdomain, ip)
-
-				// We still publish for the log, but we won't use this event to trigger scans anymore
-				s.Brain.Publish(engine.Event{
-					Type:    engine.EventSubdomainFound,
-					Target:  subdomain,
-					Payload: "Passive-Source",
-				})
+				// Optional: Tell Brain immediately so UI updates
+				// s.Brain.Publish(engine.Event{Type: engine.EventSubdomainFound, Target: subdomain, Payload: "Alive"})
 			}
 		}(d)
 	}
-	wg.Wait()
 
+	wg.Wait()
 	return alive
 }
